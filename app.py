@@ -2,9 +2,10 @@
 from datetime import date
 from pathlib import Path
 import base64
-import hmac
 import html
 import json
+import hashlib
+import smtplib
 
 import pandas as pd
 import streamlit as st
@@ -12,6 +13,9 @@ import streamlit as st
 from reporting import (ROOT, FIELDS, BASES, STATUSES, new_draft, loads_draft,
                        normalise_rows, validate, totals, sections, period,
                        export_docx, filename)
+from security import setting, gate
+from storage import storage_root, save_draft, archived_files
+from submission import email_config, send_submission
 
 st.set_page_config(page_title='DM RMO Monthly Reporting', page_icon='📋', layout='wide')
 st.markdown('''<style>
@@ -22,23 +26,8 @@ div[data-testid="stTabs"] button{font-weight:600}
 @media(max-width:650px){.block-container{padding:1rem}h1{font-size:1.7rem!important}}
 </style>''', unsafe_allow_html=True)
 
-def setting(name, default=''):
-    try: return st.secrets.get(name, default)
-    except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError): return default
-
 def login():
-    expected=setting('APP_PASSWORD')
-    if not expected:return
-    if st.session_state.get('authenticated'):return
-    st.title('DM RMO Reporting')
-    with st.form('login'):
-        entered=st.text_input('App password',type='password')
-        submit=st.form_submit_button('Sign in')
-    if submit:
-        if hmac.compare_digest(entered.encode(),str(expected).encode()):
-            st.session_state.authenticated=True;st.rerun()
-        else:st.error('Password is incorrect.')
-    st.stop()
+    if not gate('app','APP_PASSWORD'):st.stop()
 
 login()
 if 'draft' not in st.session_state:
@@ -62,8 +51,8 @@ with st.sidebar:
     if st.checkbox('Confirm clearing the current draft',key='reset_confirm'):
         if st.button('Start a blank draft',width='stretch'):restore(new_draft());st.rerun()
     st.divider()
-    st.caption('Save your draft JSON before closing. Sessions are temporary; this version has no shared database or automatic cloud storage.')
-    if setting('APP_PASSWORD') and st.button('Sign out'):
+    st.caption('Save your draft JSON before closing. Server archives are available to administrators; cloud-local files may be lost on restart or redeployment.')
+    if st.button('Sign out'):
         st.session_state.clear();st.rerun()
 
     variant=st.selectbox('Logo artwork',['Enhanced','Original template'],index=0 if st.session_state.draft['meta'].get('logo_variant')=='Enhanced' else 1,key=f'logo_{st.session_state.epoch}')
@@ -83,7 +72,7 @@ st.write('Capture activities against your KRAs, review hours and evidence, and g
 d=st.session_state.draft;m=d['meta'];n=d['narratives'];epoch=st.session_state.epoch
 def key(k):return f'{k}_{epoch}'
 
-tabs=st.tabs(['1 · Reporting details','2 · Activities and hours','3 · Narratives','4 · Preview and downloads','5 · Stream overview'])
+tabs=st.tabs(['1 · Reporting details','2 · Activities and hours','3 · Narratives','4 · Preview and downloads','5 · Admin dashboard'])
 with tabs[0]:
     st.subheader('Reporting details')
     a,b=st.columns(2)
@@ -204,8 +193,61 @@ with tabs[3]:
     with c3:st.download_button('Save draft · JSON',json.dumps(d,indent=2,ensure_ascii=False,allow_nan=False),file_name='RMO_monthly_draft.json',mime='application/json',width='stretch')
     st.download_button('Download activity register · CSV',pd.DataFrame(d['activities'],columns=FIELDS).to_csv(index=False),file_name='RMO_activity_register.csv',mime='text/csv')
     st.download_button('Download supplied Word template',(ROOT/'templates/rmo_template.docx').read_bytes(),file_name='DM_RMO_Executive_Summary_Template.docx')
+    if st.button('Save draft to server archive',width='stretch'):
+        if errors:st.error('Resolve validation errors before saving a server draft.')
+        else:
+            root,notice=storage_root(setting('BASE_DIR'))
+            if notice:st.warning(notice)
+            try:save_draft(d,root);st.success('Draft saved for administrator review. Also keep a downloaded JSON backup.')
+            except OSError:st.error('Server storage is unavailable. Download the JSON draft instead.')
+    st.subheader('Submit reports')
+    try:
+        _,_,recipient,email_mode=email_config(setting)
+        email_problem=''
+        st.caption(f"{'Testing' if email_mode=='testing' else 'Administrator'} mode · Reports will be sent to {recipient}.")
+    except ValueError as exc:
+        email_problem=str(exc);st.info(email_problem)
+    fingerprint=hashlib.sha256(json.dumps(d,sort_keys=True,ensure_ascii=False,allow_nan=False).encode()).hexdigest()
+    already_sent=st.session_state.get('last_email_submission')==fingerprint
+    if already_sent:st.success('These report contents were already accepted by Gmail during this session.')
+    if st.button('Submit workplan and progress report by email',type='primary',disabled=bool(errors or email_problem or already_sent),width='stretch'):
+        try:
+            with st.spinner('Sending your Word reports…'):
+                recipient=send_submission(d,setting)
+            st.session_state.last_email_submission=fingerprint
+            st.success(f'Gmail accepted the submission to {recipient}. Check the inbox or spam folder for delivery.')
+        except (smtplib.SMTPException,OSError):
+            st.error('Email delivery could not be confirmed. Check the mailbox before retrying. Verify your Gmail address and Google App Password in Secrets.')
+        except ValueError as exc:st.error(str(exc))
 
 with tabs[4]:
+    admin_access=gate('admin','ADMIN_PASSWORD')
+    if admin_access:
+        if st.button('Lock admin dashboard'):
+            st.session_state.pop('admin_auth',None);st.rerun()
+        root,notice=storage_root(setting('BASE_DIR'))
+        if notice:st.warning(notice)
+        st.caption('Admin access unlocks archived drafts and the cross-stream overview. Admin credentials are separate from the app login.')
+        try:
+            _,_,destination,mode=email_config(setting)
+            st.caption(f'Email submissions: {mode} mode → {destination}.')
+        except ValueError as exc:st.caption('Email submissions unavailable: '+str(exc))
+        try:saved=archived_files(root)
+        except OSError:saved=[];st.error('Server archive cannot be accessed.')
+        if saved:
+            chosen=st.selectbox('Archived draft',saved,format_func=lambda p:p.name)
+            try:
+                raw=chosen.read_bytes();archived=loads_draft(raw)
+                st.write(f"{archived['meta']['substream']} · {archived['meta']['prepared_by']}")
+                st.download_button('Download archived draft JSON',raw,chosen.name,'application/json')
+                if st.button('Open archived draft in editor'):
+                    restore(archived);st.rerun()
+            except (ValueError,OSError):st.error('This archived draft could not be read.')
+        else:st.info('No server drafts have been saved yet.')
+    else:
+        st.caption('Enter the separate admin password to review archived drafts and cross-stream reports.')
+
+def admin_overview():
     st.subheader('Overview across sub-streams')
     st.write('Upload saved drafts from participating sub-streams to compare reported progress and forward hours. This does not merge their underlying documents.')
     files=st.file_uploader('Sub-stream draft files',type=['json'],accept_multiple_files=True,key='overview_upload')
@@ -229,6 +271,9 @@ with tabs[4]:
         df=pd.DataFrame(records);st.dataframe(df,hide_index=True,width='stretch')
         st.download_button('Download overview · CSV',df.to_csv(index=False),'RMO_substream_overview.csv','text/csv')
     else:st.info('Upload one or more saved draft files to see the overview.')
+
+with tabs[4]:
+    if admin_access:admin_overview()
 
 st.divider()
 st.caption('DM RMO · Monthly planning, progress and portfolio of evidence. Generated reports remain subject to verification and signature.')

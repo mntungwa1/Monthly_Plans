@@ -47,7 +47,11 @@ class ReportingTests(unittest.TestCase):
 class AppTests(unittest.TestCase):
     def test_blank_example_and_restored_widgets(self):
         from streamlit.testing.v1 import AppTest
-        at=AppTest.from_file(str(ROOT/'app.py'),default_timeout=30).run()
+        at=AppTest.from_file(str(ROOT/'app.py'),default_timeout=30)
+        at.secrets['APP_PASSWORD']='test-password'
+        at.run()
+        at.text_input[0].set_value('test-password')
+        next(b for b in at.button if b.label=='Sign in').click().run()
         self.assertFalse(at.exception)
         next(b for b in at.button if b.label=='Load BBB example').click().run()
         self.assertFalse(at.exception)
@@ -74,5 +78,90 @@ class AppTests(unittest.TestCase):
         next(b for b in at.button if b.label=='Sign in').click().run()
         self.assertFalse(at.exception)
         self.assertEqual(at.text_input[0].label,'Sub-stream name')
+
+    def test_blank_password_blocks_access(self):
+        from streamlit.testing.v1 import AppTest
+        at=AppTest.from_file(str(ROOT/'app.py'),default_timeout=30)
+        at.secrets['APP_PASSWORD']=' '
+        at.run()
+        self.assertFalse(at.exception)
+        self.assertEqual(len(at.tabs),0)
+        self.assertTrue(any('missing or blank' in e.value for e in at.error))
+
+    def test_admin_requires_separate_password(self):
+        from streamlit.testing.v1 import AppTest
+        at=AppTest.from_file(str(ROOT/'app.py'),default_timeout=30)
+        at.secrets['APP_PASSWORD']='app-test'
+        at.secrets['ADMIN_PASSWORD']='admin-test'
+        at.run();at.text_input[0].set_value('app-test')
+        next(b for b in at.button if b.label=='Sign in').click().run()
+        self.assertFalse(at.exception)
+        self.assertFalse(any(b.label=='Lock admin dashboard' for b in at.button))
+        next(x for x in at.text_input if x.label=='Admin password').set_value('app-test')
+        next(b for b in at.button if b.label=='Unlock admin dashboard').click().run()
+        self.assertFalse(any(b.label=='Lock admin dashboard' for b in at.button))
+        next(x for x in at.text_input if x.label=='Admin password').set_value('admin-test')
+        next(b for b in at.button if b.label=='Unlock admin dashboard').click().run()
+        self.assertFalse(at.exception)
+        self.assertTrue(any(b.label=='Lock admin dashboard' for b in at.button))
+        next(b for b in at.button if b.label=='Lock admin dashboard').click().run()
+        self.assertFalse(any(b.label=='Lock admin dashboard' for b in at.button))
+
+class StorageTests(unittest.TestCase):
+    def test_archive_roundtrip(self):
+        import tempfile
+        from storage import save_draft,archived_files
+        with tempfile.TemporaryDirectory() as folder:
+            root=Path(folder);d=new_draft()
+            first=save_draft(d,root);second=save_draft(d,root)
+            self.assertNotEqual(first,second)
+            self.assertEqual(len(archived_files(root)),2)
+            self.assertEqual(d,loads_draft((root/first).read_bytes()))
+
+class EmailTests(unittest.TestCase):
+    def setUp(self):
+        self.config={'EMAIL_ADDRESS':'dingaanm@gmail.com','EMAIL_PASSWORD':'test-app-password',
+                     'ADMIN_EMAIL':'admin@ncuma.co.za','EMAIL_MODE':'testing'}
+        self.d=loads_draft((ROOT/'examples/bbb_example.json').read_bytes())
+    def test_testing_and_admin_routing(self):
+        from submission import email_config
+        self.assertEqual(email_config(self.config.get)[2],'dingaanm@gmail.com')
+        self.config['EMAIL_MODE']='administrator'
+        self.assertEqual(email_config(self.config.get)[2],'admin@ncuma.co.za')
+        self.config['ADMIN_EMAIL']='admin @ncuma.co.za'
+        with self.assertRaises(ValueError):email_config(self.config.get)
+    def test_empty_credentials_block_email(self):
+        from submission import email_config
+        self.config['EMAIL_PASSWORD']=' '
+        with self.assertRaises(ValueError):email_config(self.config.get)
+    def test_smtp_submission_contains_both_reports(self):
+        from unittest.mock import patch
+        from submission import send_submission
+        with patch('submission.smtplib.SMTP_SSL') as smtp:
+            client=smtp.return_value.__enter__.return_value
+            client.send_message.return_value={}
+            recipient=send_submission(self.d,self.config.get)
+            self.assertEqual(recipient,'dingaanm@gmail.com')
+            client.login.assert_called_once_with('dingaanm@gmail.com','test-app-password')
+            message=client.send_message.call_args.args[0]
+            self.assertEqual(message['To'],'dingaanm@gmail.com')
+            attachments=list(message.iter_attachments())
+            self.assertEqual(len(attachments),2)
+            self.assertTrue(all(a.get_filename().endswith('.docx') for a in attachments))
+            self.assertNotIn('test-app-password',message.as_string())
+    def test_submission_button_and_duplicate_guard(self):
+        from unittest.mock import patch
+        from streamlit.testing.v1 import AppTest
+        at=AppTest.from_file(str(ROOT/'app.py'),default_timeout=30)
+        at.secrets.update(self.config)
+        at.secrets['APP_PASSWORD']='app-test'
+        at.run();at.text_input[0].set_value('app-test')
+        next(b for b in at.button if b.label=='Sign in').click().run()
+        next(b for b in at.button if b.label=='Load BBB example').click().run()
+        with patch('submission.send_submission',return_value='dingaanm@gmail.com') as send:
+            next(b for b in at.button if b.label=='Submit workplan and progress report by email').click().run()
+            self.assertFalse(at.exception);send.assert_called_once()
+            at.run()
+            self.assertTrue(next(b for b in at.button if b.label=='Submit workplan and progress report by email').disabled)
 
 if __name__=='__main__':unittest.main()
